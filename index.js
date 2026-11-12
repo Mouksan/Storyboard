@@ -266,8 +266,14 @@ LENGTH: 130-180 words.`;
 const defaultSettings = {
     seedVersion: SEED_VERSION,
     enabled: true,
+    // Источник модели: 'profile' — профиль таверны, 'custom' — напрямую по адресу.
+    promptSource: 'profile',
     // '' = текущее подключение таверны. Иначе id профиля из Connection Manager.
     profileId: '',
+    // «Напрямую»: любой OpenAI-совместимый адрес, свой у Сториборда.
+    customEndpoint: '',
+    customKey: '',
+    customModel: '',
     activePresetId: 'manhwa',
     // Размышления модели тратятся из того же бюджета, что и видимый ответ,
     // поэтому лимит щедрый: на скупом ответ обрывается на полуслове.
@@ -574,14 +580,102 @@ function sbStripPreamble(text) {
         .trim();
 }
 
+// ─── «Напрямую»: OpenAI-совместимый адрес (портировано из Рила) ──────────
+
+// Запрос не потоковый, так что это потолок на весь ответ целиком.
+const SB_CUSTOM_TIMEOUT_MS = 300_000;
+// Что уходит в reasoning_effort при «Размышления: минимум». 'low' понимают
+// почти все OpenAI-совместимые прокси; 'minimal' — только часть моделей.
+const SB_CUSTOM_REASONING_MIN = 'low';
+
+/** Адрес как в комментах: можно с /v1 или полным до /chat/completions. */
+function sbNormalizeCustomEndpoint(raw) {
+    let url;
+    try {
+        url = new URL(String(raw || '').trim());
+    } catch {
+        return null;
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    const path = url.pathname.replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(path)) return url.origin + path;
+    if (/\/v1$/i.test(path)) return `${url.origin}${path}/chat/completions`;
+    return `${url.origin}/v1/chat/completions`;
+}
+
+/** Достаёт текст из ответа (OpenAI, Claude-подобный, Gemini) — как в комментах. */
+function sbExtractCustomText(data) {
+    if (!data) return '';
+    if (typeof data === 'string') return data;
+    const fromBlocks = (blocks) => blocks.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n');
+    const choice = data.choices?.[0]?.message?.content;
+    if (typeof choice === 'string') return choice;
+    if (Array.isArray(choice)) return fromBlocks(choice);
+    if (typeof data.content === 'string') return data.content;
+    if (Array.isArray(data.content)) return fromBlocks(data.content);
+    const parts = data.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) return parts.filter(p => typeof p?.text === 'string' && !p.thought).map(p => p.text).join('');
+    if (typeof data.text === 'string') return data.text;
+    return '';
+}
+
 /**
- * Отправляет запрос выбранным профилем или текущим подключением таверны.
+ * Прямой запрос из браузера: лимит токенов и размышления как у профиля.
+ * Адрес должен отдавать CORS-заголовки.
+ */
+async function sbRequestCustomEndpoint(instruction, contextText, maxTokens) {
+    const settings = getSettings();
+    const url = sbNormalizeCustomEndpoint(settings.customEndpoint);
+    if (!url) throw new Error('Не указан адрес модели — загляни в настройки Storyboard («Напрямую»).');
+
+    const body = {
+        messages: [
+            { role: 'system', content: instruction },
+            { role: 'user', content: contextText },
+        ],
+        stream: false,
+        max_tokens: maxTokens,
+    };
+    const model = String(settings.customModel || '').trim();
+    if (model) body.model = model;
+    if (settings.reasoningEffort === 'min') body.reasoning_effort = SB_CUSTOM_REASONING_MIN;
+
+    const headers = { 'Content-Type': 'application/json' };
+    const key = String(settings.customKey || '').trim();
+    if (key) headers.Authorization = `Bearer ${key}`;
+
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), SB_CUSTOM_TIMEOUT_MS);
+    sbLog('INFO', `Напрямую: ${url}, модель ${model || '(по умолчанию)'}`);
+
+    let response;
+    try {
+        response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: timeout.signal });
+    } catch (error) {
+        if (timeout.signal.aborted) throw new Error(`Endpoint did not respond within ${SB_CUSTOM_TIMEOUT_MS / 1000} s`);
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Endpoint HTTP ${response.status}${text ? `: ${text.slice(0, 300)}` : ''}`);
+    }
+    return sbExtractCustomText(await response.json());
+}
+
+/**
+ * Отправляет запрос напрямую, выбранным профилем или текущим подключением таверны.
  * @returns {Promise<string>} текст промпта
  */
 async function sbRequestPrompt(instruction, contextText) {
     const context = getContext();
     const settings = getSettings();
     const maxTokens = settings.maxTokens || defaultSettings.maxTokens;
+
+    if (settings.promptSource === 'custom') {
+        return sbRequestCustomEndpoint(instruction, contextText, maxTokens);
+    }
 
     if (settings.profileId) {
         const messages = [
@@ -870,6 +964,9 @@ async function sbGeneratePrompt(messageId, existingOverlay = null) {
 
     const profileName = (() => {
         const settings = getSettings();
+        if (settings.promptSource === 'custom') {
+            return `напрямую · ${String(settings.customModel || '').trim() || 'модель по умолчанию'}`;
+        }
         if (!settings.profileId) return 'текущее подключение';
         const profiles = context.extensionSettings?.connectionManager?.profiles || [];
         return profiles.find(p => p.id === settings.profileId)?.name || 'профиль не найден';
@@ -1261,6 +1358,11 @@ function sbOpenPresetManager() {
 // Панель настроек
 // ═══════════════════════════════════════════════════════════════════════
 
+/** Значение для атрибута value="…" в разметке панели. */
+function sbEscapeAttr(text) {
+    return String(text ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function buildSettingsPanel() {
     const container = document.getElementById('extensions_settings');
     if (!container) return;
@@ -1286,9 +1388,27 @@ function buildSettingsPanel() {
                         <span>Включено</span>
                     </label>
 
-                    <label for="sb_profile" style="margin-top: 10px; display: block;">Профиль подключения</label>
-                    <select id="sb_profile" class="text_pole"></select>
-                    <div class="sb-hint" id="sb_profile_hint">Пусто — используется текущее подключение таверны.</div>
+                    <label style="margin-top: 10px; display: block;">Источник</label>
+                    <div class="sb-seg" id="sb_source">
+                        <button type="button" class="sb-seg-btn ${settings.promptSource !== 'custom' ? 'active' : ''}" data-src="profile">Профиль</button>
+                        <button type="button" class="sb-seg-btn ${settings.promptSource === 'custom' ? 'active' : ''}" data-src="custom">Напрямую</button>
+                    </div>
+
+                    <div id="sb_src_profile" ${settings.promptSource === 'custom' ? 'hidden' : ''}>
+                        <label for="sb_profile" style="margin-top: 10px; display: block;">Профиль подключения</label>
+                        <select id="sb_profile" class="text_pole"></select>
+                        <div class="sb-hint" id="sb_profile_hint">Пусто — используется текущее подключение таверны.</div>
+                    </div>
+
+                    <div id="sb_src_custom" ${settings.promptSource === 'custom' ? '' : 'hidden'}>
+                        <label for="sb_custom_endpoint" style="margin-top: 10px; display: block;">Endpoint URL</label>
+                        <input type="url" id="sb_custom_endpoint" class="text_pole" placeholder="https://api.example.com/v1" value="${sbEscapeAttr(settings.customEndpoint)}">
+                        <label for="sb_custom_key" style="margin-top: 10px; display: block;">API-ключ</label>
+                        <input type="password" id="sb_custom_key" class="text_pole" autocomplete="off" placeholder="sk-..." value="${sbEscapeAttr(settings.customKey)}">
+                        <label for="sb_custom_model" style="margin-top: 10px; display: block;">ID модели (необязательно)</label>
+                        <input type="text" id="sb_custom_model" class="text_pole" placeholder="по умолчанию у API" value="${sbEscapeAttr(settings.customModel)}">
+                        <div class="sb-hint">Любой OpenAI-совместимый адрес, можно с /v1 или полным до /chat/completions. Профиль таверны не трогается.</div>
+                    </div>
 
                     <label for="sb_preset" style="margin-top: 10px; display: block;">Пресет</label>
                     <select id="sb_preset" class="text_pole">${presetOptions}</select>
@@ -1306,7 +1426,7 @@ function buildSettingsPanel() {
                         <option value="min" ${settings.reasoningEffort === 'min' ? 'selected' : ''}>Минимум</option>
                         <option value="auto" ${settings.reasoningEffort === 'auto' ? 'selected' : ''}>На усмотрение модели</option>
                     </select>
-                    <div class="sb-hint">Работает только при выбранном профиле подключения. Gemini 3.x Pro всё равно думает минимум на уровне low — Google не даёт отключить полностью.</div>
+                    <div class="sb-hint">Работает и с профилем, и напрямую. Gemini 3.x Pro всё равно думает минимум на уровне low — Google не даёт отключить полностью.</div>
 
                     <label class="checkbox_label" style="margin-top: 10px;">
                         <input type="checkbox" id="sb_strip_apostrophes" ${settings.stripApostrophes !== false ? 'checked' : ''}>
@@ -1333,6 +1453,24 @@ function buildSettingsPanel() {
         getSettings().activePresetId = e.target.value;
         saveSettings();
     });
+
+    document.getElementById('sb_source')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-src]');
+        if (!btn) return;
+        const source = btn.dataset.src === 'custom' ? 'custom' : 'profile';
+        getSettings().promptSource = source;
+        saveSettings();
+        for (const b of document.querySelectorAll('#sb_source [data-src]')) b.classList.toggle('active', b === btn);
+        document.getElementById('sb_src_profile').hidden = source === 'custom';
+        document.getElementById('sb_src_custom').hidden = source !== 'custom';
+    });
+
+    for (const [id, key] of [['sb_custom_endpoint', 'customEndpoint'], ['sb_custom_key', 'customKey'], ['sb_custom_model', 'customModel']]) {
+        document.getElementById(id)?.addEventListener('change', (e) => {
+            getSettings()[key] = String(e.target.value || '').trim();
+            saveSettings();
+        });
+    }
 
     document.getElementById('sb_max_tokens')?.addEventListener('change', (e) => {
         const value = parseInt(e.target.value, 10);
