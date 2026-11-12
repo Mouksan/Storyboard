@@ -1008,7 +1008,7 @@ function addStoryboardButton(messageElement, messageId) {
     if (!extraMesButtons) return;
 
     const btn = document.createElement('div');
-    btn.className = 'mes_button sb-prompt-btn fa-solid fa-paintbrush interactable';
+    btn.className = 'mes_button sb-prompt-btn fa-solid fa-feather-pointed interactable';
     btn.title = 'Промпт для картинки';
     btn.tabIndex = 0;
     btn.addEventListener('click', (e) => {
@@ -1376,12 +1376,12 @@ function buildSettingsPanel() {
     const html = `
         <div id="sb_settings_root" class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b><i class="fa-solid fa-paintbrush" style="margin-right: 6px;"></i>「 STORYBOARD 」</b>
+                <b><i class="fa-solid fa-feather-pointed" style="margin-right: 6px;"></i>「 STORYBOARD 」</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
                 <div class="sb-settings">
-                    <p class="sb-intro">Просит модель написать промпт для картинки по уже готовому посту. Кнопка с кистью — в меню кнопок под каждым сообщением.</p>
+                    <p class="sb-intro">Просит модель написать промпт для картинки по уже готовому посту. Кнопка с пером — в меню кнопок под каждым сообщением.</p>
 
                     <label class="checkbox_label">
                         <input type="checkbox" id="sb_enabled" ${settings.enabled ? 'checked' : ''}>
